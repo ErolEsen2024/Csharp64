@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 
@@ -8,122 +9,216 @@ namespace CreatePRG
     {
         static void Main(string[] args)
         {
-            // The output file name for the generated Commodore 64 PRG file.
-            string fileName = "hello.prg";
+            // ========================
+            // BASIC + machine code file settings
+            // ========================
+            string fileName = "hello.prg";   // Output PRG filename
+            ushort loadAddress = 0x0801;     // Standard BASIC start address ($0801)
 
-            // ============================
-            // BASIC PROGRAM HEADER VALUES
-            // ============================
+            // ========================
+            // 1) BUILD MACHINE CODE SECTION
+            // ========================
+            // We'll dynamically assemble 6502 machine code into this list
+            List<byte> mcode = new List<byte>();
 
-            // The standard C64 BASIC program load address.
-            // $0801 (2049 decimal) is where BASIC programs typically start in memory.
-            // This is the first two bytes of the PRG file (little endian).
-            ushort loadAddress = 0x0801;
+            // Indices where we will later "patch" absolute or relative addresses
+            // (we don't know them yet until code size is determined)
+            int idx_msg_lo = -1;
+            int idx_msg_hi = -1;
+            int idx_beq_rel = -1;
+            int idx_jmp_loop_lo = -1;
+            int idx_jmp_loop_hi = -1;
+            int idx_jmp_done_lo = -1;  // (not used in this example but declared)
+            int idx_jmp_done_hi = -1;  // (ditto)
+            int idx_jmp_waitkey_lo = -1;
+            int idx_jmp_waitkey_hi = -1;
 
-            // The address in memory of the next BASIC line after this one.
-            // This is how Commodore BASIC internally chains lines together.
-            // If the address is 0, BASIC knows it's the end of the program.
-            // Here 0x0817 is hardcoded as the pointer to the next line,
-            // which happens to be just after the line we're creating.
-            ushort nextAddress = 0x0817;
+            // --- Clear the screen using ROM routine at $E544
+            //     Equivalent to: JSR $E544
+            mcode.Add(0x20); mcode.Add(0x44); mcode.Add(0xE5);
 
-            // The BASIC line number for the program. (0x000A = decimal 10)
-            // When you list the program on the C64, this will appear as:
-            //   10 PRINT "HELLO, WORLD!"
-            ushort lineNumber = 0x000A;
+            // --- Initialize X register to 0: LDX #$00
+            mcode.Add(0xA2); mcode.Add(0x00);
 
-            // BASIC token for the PRINT command is $99 (153 decimal).
-            // Commodore BASIC uses tokens for keywords instead of storing them as text.
-            byte byteToken = 0x99;
+            // Remember the loop start for later jump
+            int loopIndex = mcode.Count;
 
-            // ================================
-            // CREATE AND WRITE THE PRG FILE
-            // ================================
+            // --- LDA message,X  (load next character from message)
+            mcode.Add(0xBD);
+            idx_msg_lo = mcode.Count; mcode.Add(0x00); // low byte of message addr (to patch later)
+            idx_msg_hi = mcode.Count; mcode.Add(0x00); // high byte of message addr
 
-            // Create a new file stream for the output file, with write access.
-            // Using "using" ensures the stream is properly closed and disposed
-            // even if an exception occurs.
-            using (var fs = new FileStream(fileName, FileMode.Create, FileAccess.Write))
-            using (var bw = new BinaryWriter(fs))
+            // --- BEQ done  (if zero byte reached, branch to end)
+            mcode.Add(0xF0);
+            idx_beq_rel = mcode.Count; mcode.Add(0x00); // relative offset patched later
+
+            // --- STA $0400,X (write char to screen at $0400 + X)
+            mcode.Add(0x9D); mcode.Add(0x00); mcode.Add(0x04);
+
+            // --- INX (increment X to move to next character)
+            mcode.Add(0xE8);
+
+            // --- JMP loop (go back for next character)
+            mcode.Add(0x4C);
+            idx_jmp_loop_lo = mcode.Count; mcode.Add(0x00); // patched later
+            idx_jmp_loop_hi = mcode.Count; mcode.Add(0x00);
+
+            // Mark where "done" code will start (after loop finishes)
+            int doneIndex = mcode.Count;
+
+            // --- JMP waitkey (jump to subroutine that waits for a keypress)
+            mcode.Add(0x4C);
+            idx_jmp_waitkey_lo = mcode.Count; mcode.Add(0x00); // patched later
+            idx_jmp_waitkey_hi = mcode.Count; mcode.Add(0x00);
+
+            // ========================
+            // 2) MESSAGE BYTES (SCREEN CODES)
+            // ========================
+            string text = "HELLO, WORLD!";
+            byte[] screenCode = ConvertToScreenCodes(text);
+            int msgIndex = mcode.Count;
+            mcode.AddRange(screenCode);
+            mcode.Add(0x00); // message terminator (0 signals BEQ end)
+
+            // ========================
+            // 3) WAIT FOR KEY ROUTINE
+            // ========================
+            // This little routine polls GETIN ($FFE4) until a nonzero char is read.
+            //   loop:
+            //     JSR $FFE4   ; read keyboard buffer
+            //     CMP #$00    ; compare with zero
+            //     BEQ loop    ; if zero, no key yet → loop
+            //     RTS         ; return to BASIC
+            int waitKeyIndex = mcode.Count;
+
+            // --- JSR $FFE4 (GETIN)
+            mcode.Add(0x20); mcode.Add(0xE4); mcode.Add(0xFF);
+
+            // --- CMP #$00
+            mcode.Add(0xC9); mcode.Add(0x00);
+
+            // --- BEQ back to waitKeyIndex (offset patched later)
+            mcode.Add(0xF0);
+            int beqWaitOffsetIndex = mcode.Count; mcode.Add(0x00); // placeholder
+
+            // --- RTS
+            mcode.Add(0x60);
+
+            // We'll calculate the branch offset for BEQ once we know baseAddr
+            int beqOpcodeAddr_WK = 0;
+
+            // ========================
+            // 4) BASIC AUTO-RUN STUB
+            // ========================
+            // This is a BASIC line 10: SYS xxxx
+            // It will be placed at $0801 and tells BASIC to jump to machine code.
+            const byte TOK_SYS = 0x9E;   // BASIC token for SYS
+            bool spaceAfterSys = true;   // Insert a space after SYS for readability
+
+            // We have to calculate the decimal length of the address because SYS uses ASCII digits
+            int digitsLen = 1;
+            int machineCodeStart = 0;
+            while (true)
             {
-                // ----------------------------
-                // 1) WRITE LOAD ADDRESS
-                // ----------------------------
-                // Commodore PRG files start with a 2-byte little-endian
-                // memory address indicating where to load the file in memory.
-                // Here: $0801 → bytes [0x01, 0x08].
-                bw.Write((byte)(loadAddress & 0xFF));  // Low byte
-                bw.Write((byte)(loadAddress >> 8));    // High byte
-
-                // ----------------------------
-                // 2) WRITE BASIC LINE POINTER
-                // ----------------------------
-                // Each BASIC line starts with a 2-byte pointer to the address
-                // of the next line in memory. This allows the BASIC interpreter
-                // to traverse the program line by line.
-                bw.Write((byte)(nextAddress & 0xFF));  // Low byte of next line
-                bw.Write((byte)(nextAddress >> 8));    // High byte of next line
-
-                // ----------------------------
-                // 3) WRITE LINE NUMBER
-                // ----------------------------
-                // Next comes the 2-byte line number, little endian.
-                // This is what the user sees in LIST.
-                bw.Write((byte)(lineNumber & 0xFF));   // Low byte of line number
-                bw.Write((byte)(lineNumber >> 8));     // High byte of line number
-
-                // ----------------------------
-                // 4) WRITE BASIC TOKENS + TEXT
-                // ----------------------------
-                // First, the PRINT token ($99)
-                bw.Write(byteToken);
-
-                // Then we append the BASIC code after the PRINT keyword.
-                // Here, BuildBasicLine returns the PETSCII-encoded bytes for:
-                //   " \"HELLO, WORLD!\""
-                // including a null terminator (0x00) at the end of the line.
-                bw.Write(BuildBasicLine(" \"HELLO, WORLD!\""));
-
-                // ----------------------------
-                // 5) WRITE PROGRAM TERMINATOR
-                // ----------------------------
-                // The end of a Commodore BASIC program is indicated by a line pointer
-                // of 0x0000 (two zero bytes). This is how BASIC knows it's the end.
-                bw.Write((byte)0x00);
-                bw.Write((byte)0x00);
+                // 7 bytes overhead (link pointer + line number + token + terminators) + digit length
+                int stubLen = 7 + digitsLen;
+                machineCodeStart = loadAddress + stubLen + 2; // BASIC header itself is 2 bytes for load addr
+                int newLen = machineCodeStart.ToString().Length;
+                if (newLen == digitsLen) break;
+                digitsLen = newLen;
             }
 
-            // Notify the user that the file was successfully created.
-            Console.WriteLine("C64 PRG file '" + fileName + "' created.");
+            // Build the SYS line
+            string addrStr = machineCodeStart.ToString();
+            List<byte> basicStub = new List<byte>();
+            int stubTotalLen = 7 + addrStr.Length;
+            int pointerToEnd = loadAddress + stubTotalLen;
+
+            // --- Pointer to next line (or 0 to end)
+            basicStub.Add((byte)(pointerToEnd & 0xFF));
+            basicStub.Add((byte)(pointerToEnd >> 8));
+
+            // --- Line number (10)
+            basicStub.Add(10);
+            basicStub.Add(0x00);
+
+            // --- SYS token + (optional) space + address ASCII
+            basicStub.Add(TOK_SYS);
+            if (spaceAfterSys) basicStub.Add(0x20);
+            basicStub.AddRange(Encoding.ASCII.GetBytes(addrStr));
+            basicStub.Add(0x00); // end of line
+
+            // --- Program terminator (end of BASIC)
+            basicStub.Add(0x00);
+            basicStub.Add(0x00);
+
+            // ========================
+            // 5) PATCH ADDRESSES IN MACHINE CODE
+            // ========================
+            // Now that BASIC stub is built, we know where machine code will start
+            int baseAddr = loadAddress + basicStub.Count;
+
+            // --- Message pointer in LDA message,X
+            int msgAddr = baseAddr + msgIndex;
+            mcode[idx_msg_lo] = (byte)(msgAddr & 0xFF);
+            mcode[idx_msg_hi] = (byte)(msgAddr >> 8);
+
+            // --- Loop JMP target
+            int loopAddr = baseAddr + loopIndex;
+            mcode[idx_jmp_loop_lo] = (byte)(loopAddr & 0xFF);
+            mcode[idx_jmp_loop_hi] = (byte)(loopAddr >> 8);
+
+            // --- Done JMP to waitKey routine
+            int waitKeyAddr = baseAddr + waitKeyIndex;
+            mcode[idx_jmp_waitkey_lo] = (byte)(waitKeyAddr & 0xFF);
+            mcode[idx_jmp_waitkey_hi] = (byte)(waitKeyAddr >> 8);
+
+            // --- BEQ done offset (branch if zero at end of message)
+            int doneAddr = baseAddr + doneIndex;
+            int beqOpcodeAddr = baseAddr + (idx_beq_rel - 1);  // F0 is one byte before offset
+            int relDone = doneAddr - (beqOpcodeAddr + 2);     // 6502 relative = target - (PC+2)
+            mcode[idx_beq_rel] = (byte)(relDone & 0xFF);
+
+            // --- WaitKey BEQ offset (loop back to itself)
+            beqOpcodeAddr_WK = baseAddr + (beqWaitOffsetIndex - 1);
+            int relWait = waitKeyAddr - (beqOpcodeAddr_WK + 2);
+            mcode[beqWaitOffsetIndex] = (byte)(relWait & 0xFF);
+
+            // ========================
+            // 6) WRITE FINAL .PRG FILE
+            // ========================
+            using (FileStream fs = new FileStream(fileName, FileMode.Create, FileAccess.Write))
+            using (BinaryWriter bw = new BinaryWriter(fs))
+            {
+                // Write the 2-byte load address first (little endian)
+                bw.Write((byte)(loadAddress & 0xFF));
+                bw.Write((byte)(loadAddress >> 8));
+
+                // Then write BASIC auto-run stub followed by the machine code
+                bw.Write(basicStub.ToArray());
+                bw.Write(mcode.ToArray());
+            }
+
+            Console.WriteLine("Created: " + fileName);
         }
 
-        // ================================================
-        // Helper function to build the BASIC code segment
-        // ================================================
-        static byte[] BuildBasicLine(string code)
+        // ========================
+        // HELPER: Convert ASCII text to C64 screen codes
+        // ========================
+        // In default uppercase mode:
+        //   'A' → 1, 'B' → 2 ... 'Z' → 26
+        //   Punctuation and space remain unchanged
+        static byte[] ConvertToScreenCodes(string input)
         {
-            // Convert the BASIC code text to PETSCII bytes.
-            // For simple ASCII letters and punctuation, ASCII is close enough,
-            // but a true implementation would need a full PETSCII conversion.
-            // The .ToUpper() call ensures the output matches how C64 BASIC stores keywords.
-            byte[] codeBytes = Encoding.ASCII.GetBytes(code.ToUpper());
-
-            // Structure of a BASIC line (after the line number):
-            //   [token(s) + code...][0x00 terminator]
-            //
-            // The next-line pointer and line number are handled outside this function.
-            // We just return the tokenized line data ending with a null terminator.
-            int totalLength = codeBytes.Length + 1;  // +1 for the 0x00 terminator
-            byte[] line = new byte[totalLength];
-
-            // Copy the code bytes into the line array.
-            Array.Copy(codeBytes, 0, line, 0, codeBytes.Length);
-
-            // Append the null terminator (0x00) at the end.
-            line[codeBytes.Length] = 0x00;
-
-            // Return the finished BASIC line bytes.
-            return line;
+            List<byte> output = new List<byte>();
+            foreach (char c in input)
+            {
+                if (c >= 'A' && c <= 'Z')
+                    output.Add((byte)(c - 'A' + 1));
+                else
+                    output.Add((byte)c);
+            }
+            return output.ToArray();
         }
     }
 }
